@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "piv-gate-bridge"
+version = "0.1.0"
+description = "PIV-gated FIDO2 client bridge"
+authors = ["Bryan Jacobs <b@q3q.us>", "smolBitness"]
+readme = "README.md"
+packages = [{include = "piv_gate_bridge"}]
+
+[tool.poetry.dependencies]
+python = "^3.12,<3.16"
+uhid = "^0.0.1"
+pyscard = "^2.2"
+# Only the no-hardware e2e client uses fido2; the bridge itself talks
+# CTAP2 over HTTPS (no pcsc extra, no card relay).
+fido2 = ">=1.2"
+
+[tool.poetry.scripts]
+piv-gate-bridge = 'piv_gate_bridge.bridge:main'
+package = 'package:build'
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

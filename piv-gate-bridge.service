@@ -1,0 +1,21 @@
+# User-level unit: the gate prompts for the PIV PIN on a controlling
+# tty (spec §3.4), so this is NOT an always-on system daemon.  Run with
+#   systemctl --user start piv-gate-bridge
+# or from a terminal.  The UHID device only exists after a gate pass;
+# teardown on stop is immediate (device gone when the unit stops).
+[Unit]
+Description=PIV-gated FIDO2 bridge
+After=graphical-session.target pcscd.service
+Wants=pcscd.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/piv-gate-bridge --config %h/.config/piv-gate/config.toml
+Type=simple
+Restart=no
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
