@@ -18,13 +18,15 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from piv_gate_bridge.ctap_hid_device import CTAPHIDDevice
 from piv_gate_bridge.gate import Audit, CardLink, Gate, GateHTTP
 from piv_gate_bridge.transport import HttpCtapTransport
+from piv_gate_bridge.ui import notify_info
 
 CAUSES_REMOVED = "removed"
 CAUSES_IDLE = "idle"
@@ -156,7 +158,10 @@ class Bridge:
                  reader_filter: Optional[str] = None,
                  http_timeout_s: float = 10.0, retries: int = 3,
                  t_idle: float = 600.0, t_max: float = 12 * 3600.0,
-                 stub_gate: bool = False) -> None:
+                 stub_gate: bool = False,
+                 ui_ask: Optional[Callable] = None,
+                 ui_timeout: float = 20.0,
+                 totp_labels: Optional[list] = None) -> None:
         self.server_url = server_url
         self.ca_root = ca_root
         self.client_cert = client_cert
@@ -168,7 +173,12 @@ class Bridge:
         self.t_idle = t_idle
         self.t_max = t_max
         self.stub_gate = stub_gate
+        self.ui_ask = ui_ask
+        self.ui_timeout = ui_timeout
+        self.totp_labels = list(totp_labels or [])
+        self._ask_cache: tuple = (None, None)   # ((reader, gen), choice)
         self.session: Optional[LiveSession] = None
+        self._gate_http = None   # reused by the TOTP popup path
         # Set by the signal handler alongside a live-session teardown so
         # the main loop exits instead of re-gating (SIGINT/SIGTERM must
         # stop the process — the systemd unit has Restart=no and a ^C is
@@ -189,9 +199,38 @@ class Bridge:
         http = GateHTTP(self.server_url, self.ca_root, self.client_cert,
                         self.client_key, timeout_s=self.http_timeout,
                         retries=self.retries)
+        self._gate_http = http
         gate = Gate(self._gate_link, http, self.audit,
-                    reader_filter=self.reader_filter)
+                    reader_filter=self.reader_filter,
+                    ui_ask=self._cached_ask if self.ui_ask else None,
+                    ui_timeout=self.ui_timeout,
+                    totp_labels=self.totp_labels)
         return gate.run()
+
+    def _cached_ask(self, title: str, body: str, actions: dict,
+                    timeout_s: float, reader: str = None,
+                    generation: int = None) -> Optional[str]:
+        """One ask per seated card: a failed gate run re-enters the loop
+        and would re-popup every retry (2026-09-08).  A gate-default
+        choice (click or timeout) also reclaims the reader from scdaemon,
+        which grabs it exclusively after OpenPGP use (it respawns on
+        demand — killing it is how the bridge wins the arbitration)."""
+        key = (reader, generation)
+        if self._ask_cache[0] != key:
+            choice = self.ui_ask(title, body, actions, timeout_s)
+            self._ask_cache = (key, choice)
+        else:
+            choice = self._ask_cache[1]
+        if choice in (None, "gate") or (
+                isinstance(choice, str) and choice.startswith("totp:")):
+            # Gate AND totp:<label> both continue into the PIV ceremony,
+            # which needs the reader back from scdaemon.
+            try:
+                subprocess.run(["gpgconf", "--kill", "scdaemon"],
+                               capture_output=True, timeout=5)
+            except OSError:
+                pass
+        return choice
 
     # -- live phase ------------------------------------------------------
 
@@ -253,7 +292,10 @@ class Bridge:
     # the card physically changes (insertion counter) instead of looping
     # timed retries (a ~1.5 s wrong-card loop wedged pcscd system-wide on
     # 2026-09-07, and a 429 loop sustained the server rate limit).
-    PARK_REASONS = ("no_piv_applet", "no_gate_cert", "pin_blocked")
+    # user_ssh / user_dismissed: the user handed the card to another
+    # applet (or deferred) via the applet-picker notification.
+    PARK_REASONS = ("no_piv_applet", "no_gate_cert", "pin_blocked",
+                    "user_ssh", "user_dismissed")
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -292,6 +334,14 @@ class Bridge:
                 backoff = min(backoff * 2, 60.0)
                 continue
             backoff = 1.0
+            want = getattr(result, "want", None)
+            if want:
+                # TOTP popup path: the ceremony already happened; show the
+                # code and park instead of creating the UHID device.
+                await self._totp_then_park(result, want)
+                if self._signal_exit:
+                    return
+                continue
             transport = HttpCtapTransport(
                 self.server_url, self.ca_root, self.client_cert,
                 self.client_key, timeout_s=self.http_timeout)
@@ -299,6 +349,10 @@ class Bridge:
             await dev.start()
             cause = await self.live_phase_async(result, dev)
             transport.close()
+            # Drop the gate link with the session: a "removed" teardown's
+            # zombie presence monitor can still be probing on this context
+            # when the next gate run connects (0x8010000B, 2026-09-08).
+            self._gate_link = None
             if self._signal_exit:
                 return
             logging.info("session ended (%s); waiting for next insertion", cause)
@@ -309,14 +363,23 @@ class Bridge:
         The gate link (PC/SC context) from the failed attempt is reused
         for the generation wait, then dropped so the next gate run gets
         a fresh context (the existing pcscd-restart recovery path)."""
+        ssh = result.reason == "user_ssh"
         self.audit.log("gate_park", reason=result.reason,
                        reader=result.reader, generation=result.generation)
-        logging.warning(
-            "not a gate card (%s) — parked until the card is swapped",
-            result.reason)
+        if ssh:
+            logging.warning("card released for SSH — parked until swapped")
+        else:
+            logging.warning(
+                "not a gate card (%s) — parked until the card is swapped",
+                result.reason)
         link = self._gate_link
         try:
-            await asyncio.get_running_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            if ssh:
+                # scdaemon takes the reader exclusively for OpenPGP; make
+                # gpg-agent learn the card's keys so ssh just works.
+                await loop.run_in_executor(None, self._ssh_handoff)
+            await loop.run_in_executor(
                 None, link.wait_for_generation_change,
                 result.reader, result.generation)
         except Exception as exc:
@@ -324,6 +387,52 @@ class Bridge:
         finally:
             self._gate_link = None
         self.audit.log("gate_unpark", reason=result.reason)
+
+    async def _totp_then_park(self, result, label: str) -> None:
+        """The user picked TOTP in the applet picker and the gate
+        ceremony passed: fetch the code via the same mTLS HTTP session
+        (the epoch this pass opened must still be open server-side) and
+        show it as a notification.  No UHID device is created; the
+        bridge parks until the card is swapped."""
+        code = None
+        try:
+            loop = asyncio.get_running_loop()
+            code, expires_at = await loop.run_in_executor(
+                None, self._gate_http.totp, label)
+        except Exception as exc:
+            # Refusal (unknown_label, epoch_closed) or transport failure:
+            # say so on screen — a silent park looks like the popup ate it.
+            logging.error("totp %s: %s", label, exc)
+            notify_info(f"TOTP {label} failed", str(exc), timeout_s=10.0)
+        if code is not None:
+            self.audit.log("totp_shown", label=label)
+            notify_info(f"TOTP {label}",
+                        f"{code} — valid until {expires_at}",
+                        timeout_s=30.0)
+        link = self._gate_link
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, link.wait_for_generation_change,
+                result.reader, result.generation)
+        except Exception as exc:
+            logging.warning("totp park wait failed (%s); re-gating", exc)
+        finally:
+            self._gate_link = None
+        self.audit.log("gate_unpark", reason="totp_done",
+                       reader=result.reader, generation=result.generation)
+
+    def _ssh_handoff(self) -> None:
+        """Register the card's OpenPGP keys with gpg-agent (SCD LEARN);
+        scdaemon then holds the reader exclusively until the card leaves."""
+        try:
+            subprocess.run(["gpg-connect-agent", "SCD LEARN --force", "/bye"],
+                           capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logging.warning("SCD LEARN failed: %s", exc)
+        notify_info("Card in use for SSH",
+                    "The gate is parked until this card is swapped out.",
+                    timeout_s=15.0)
 
 
 def main(argv=None) -> None:
@@ -341,12 +450,18 @@ def main(argv=None) -> None:
 
     from piv_gate_bridge.config import Config
     cfg = Config.load(args.config)
+    ui_ask = None
+    if cfg.prompt_on_ambiguous:
+        from piv_gate_bridge import ui as ui_mod
+        ui_ask = ui_mod.notify_ask
     bridge = Bridge(cfg.server_url, cfg.ca_root, cfg.client_cert,
                     cfg.client_key, cfg.audit_log,
                     reader_filter=cfg.reader_filter,
                     http_timeout_s=cfg.http_timeout, retries=cfg.retries,
                     t_idle=cfg.t_idle, t_max=cfg.t_max,
-                    stub_gate=args.gate_stub_pass)
+                    stub_gate=args.gate_stub_pass,
+                    ui_ask=ui_ask, ui_timeout=cfg.prompt_timeout,
+                    totp_labels=cfg.totp_labels)
     asyncio.run(bridge.run())
 
 

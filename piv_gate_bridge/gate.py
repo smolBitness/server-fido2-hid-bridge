@@ -35,6 +35,10 @@ log = logging.getLogger("piv-gate")
 
 PREFIX = b"piv-fido-gate-v1"
 PIV_AID = bytes.fromhex("A000000308000010000100")
+# OpenPGP RID+application prefix (generic, no card serial): a shared
+# SELECT answers 9000 on SmartPGP cards (verified live 2026-09-08), so
+# the dual-applet probe needs no per-card AID.
+OPENPGP_AID_PREFIX = bytes.fromhex("D27600012401")
 
 SW_OK = 0x9000
 SW_PIN_BLOCKED = 0x6983
@@ -102,6 +106,7 @@ class GateResult:
     reader: Optional[str] = None
     generation: Optional[int] = None
     retry_after: Optional[int] = None   # rate_limited: server hint (s)
+    want: Optional[str] = None      # totp picker choice: fetch a code
 
 
 # --- helpers ---------------------------------------------------------------
@@ -303,6 +308,54 @@ class CardLink:
         except Exception:
             return False
 
+    def probe_applets(self, reader: str) -> Optional[str]:
+        """Best-effort applet classification BEFORE the ceremony, over a
+        SHARED connection (no PIN, no transaction): 'dual' = both the PIV
+        and the OpenPGP applet answer SELECT, 'piv' = PIV only, None =
+        unprobeable (reader vanished, connect or transmit failed) — the
+        normal ceremony then delivers the authoritative verdict.
+
+        The card is talking T=1 over the SCR3310; connecting without a
+        protocol request lets pcscd negotiate and pyscard transmits with
+        the negotiated one (forcing T0 on a T1 card raises
+        0x8010000F protocol mismatch)."""
+        from smartcard.System import readers as system_readers
+        try:
+            matches = [r for r in system_readers() if str(r) == reader]
+            if not matches:
+                return None
+            conn = matches[0].createConnection()
+            conn.connect()
+            try:
+                piv_ok = self._select_ok(conn, list(APDU_SELECT_PIV))
+                opgp_ok = False
+                if piv_ok:
+                    opgp_ok = self._select_ok(conn, self._select_openpgp_apdu())
+                if piv_ok and opgp_ok:
+                    return "dual"
+                if piv_ok:
+                    return "piv"
+                return None
+            finally:
+                conn.disconnect()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _select_ok(conn, apdu: list) -> bool:
+        try:
+            _, sw1, sw2 = conn.transmit(list(apdu))
+        except Exception:
+            return False
+        if sw1 == 0x61:
+            return True       # selection succeeded, response pending
+        return (sw1 << 8) | sw2 == SW_OK
+
+    @staticmethod
+    def _select_openpgp_apdu() -> list:
+        return ([0x00, 0xA4, 0x04, 0x00, len(OPENPGP_AID_PREFIX)]
+                + list(OPENPGP_AID_PREFIX))
+
     def open_session(self, reader: str) -> "CardSession":
         return CardSession(reader)
 
@@ -481,6 +534,21 @@ class GateHTTP:
             return Verdict("fail", doc.get("reason"))
         raise TransportError(f"verify: unknown result {result!r}")
 
+    def totp(self, label: str) -> tuple:
+        """POST /v1/totp -> (code, expires_at RFC3339).  The epoch opened
+        by the ceremony that produced this GateResult must still be open.
+        Fail verdicts ride HTTP 200 like verify; they become
+        TransportError (reason in the message) for the caller to log."""
+        raw = self._post("/v1/totp", json.dumps({"label": label}).encode())
+        try:
+            doc = json.loads(raw)
+            result = doc["result"]
+        except Exception as exc:
+            raise TransportError(f"totp: malformed response: {exc}") from exc
+        if result != "pass":
+            raise TransportError(f"totp refused: {doc.get('reason')}")
+        return doc["code"], doc["expires_at"]
+
 
 # --- card steps --------------------------------------------------------------
 
@@ -546,26 +614,82 @@ class Gate:
 
     def __init__(self, link: CardLink, http: GateHTTP, audit: Audit, *,
                  reader_filter: Optional[str] = None,
-                 prompt: Optional[Callable] = None) -> None:
+                 prompt: Optional[Callable] = None,
+                 ui_ask: Optional[Callable] = None,
+                 ui_timeout: float = 20.0,
+                 totp_labels: Optional[list] = None) -> None:
         self.link = link
         self.http = http
         self.audit = audit
         self.reader_filter = reader_filter
         self._prompt = prompt or prompt_pin
+        self.ui_ask = ui_ask
+        self.ui_timeout = ui_timeout
+        self.totp_labels = list(totp_labels or [])
+        self._want_totp: Optional[str] = None
 
     def run(self) -> GateResult:
         reader, generation = self.link.wait_for_insertion(self.reader_filter)
         log.info("card inserted (reader=%s generation=%d)", reader, generation)
+        give_way = self._arbiter(reader, generation)
+        if give_way is not None:
+            return self._fail(give_way,
+                              f"card left for the {give_way} applet",
+                              reader, generation)
         try:
             try:
-                return self._gate_once(reader, generation)
+                result = self._gate_once(reader, generation)
             except StaleResponse:
                 # §3.8: malformed GA -> exactly one full re-run on a
                 # fresh session, including a fresh PIN.
                 log.warning("stale GA response — one full re-run on a fresh session")
-                return self._gate_once(reader, generation)
+                result = self._gate_once(reader, generation)
         except CardError as exc:
             return self._fail("card_error", f"gate aborted: {exc}")
+        if result.passed and self._want_totp:
+            result.want = self._want_totp
+        return result
+
+    def _arbiter(self, reader: str, generation: int) -> Optional[str]:
+        """Ask the user what the insertion is for: the gate, the OpenPGP
+        applet (dual-applet cards), or a TOTP code for a configured label.
+
+        Advisory only: no answer, no UI, or a single-applet card never
+        blocks the gate ceremony — unless TOTP labels are configured, in
+        which case PIV-only cards get a picker too (TOTP is a gate-applet
+        flow: the ceremony runs and the code rides the epoch it opens).
+        ui_ask receives reader/generation so the caller can memoize one
+        ask per seated card.  Returns a park reason ("user_ssh" /
+        "user_dismissed") or None to proceed with the gate.
+        """
+        if self.ui_ask is None:
+            return None
+        kind = self.link.probe_applets(reader)
+        dual = kind == "dual"
+        if not dual and not (self.totp_labels and kind == "piv"):
+            return None
+        actions = {"gate": "Gate (passkey)"}
+        body = ""
+        if dual:
+            actions["ssh"] = "SSH (OpenPGP)"
+            body = ("This card carries both the gate and the OpenPGP "
+                    "applet.\n")
+        for label in self.totp_labels:
+            actions[f"totp:{label}"] = f"TOTP: {label}"
+        actions["dismiss"] = "Not now"
+        choice = self.ui_ask(
+            "Card inserted — choose the applet",
+            body + f"Defaulting to the gate in {int(self.ui_timeout)}s.",
+            actions, self.ui_timeout, reader=reader, generation=generation)
+        self.audit.log("applet_choice", choice=choice or "timeout",
+                       reader=reader, generation=generation)
+        if choice == "ssh":
+            return "user_ssh"
+        if choice == "dismiss":
+            return "user_dismissed"
+        if isinstance(choice, str) and choice.startswith("totp:"):
+            self._want_totp = choice[len("totp:"):]
+        return None
 
     def _gate_once(self, reader: str, generation: int) -> GateResult:
         session = self.link.open_session(reader)

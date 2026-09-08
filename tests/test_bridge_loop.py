@@ -195,5 +195,68 @@ class Escalation(unittest.TestCase):
         self.assertEqual(calls, [1.0, 2.0, 1.0])
 
 
+class TotpPath(unittest.TestCase):
+    """A pass with result.want (TOTP picker choice): no UHID device —
+    the code is fetched, shown as a notification, and the bridge parks
+    until the card is swapped."""
+
+    def make(self, results, totp):
+        b = make_bridge(results)
+        b._gate_http = mock.Mock(totp=mock.Mock(side_effect=totp))
+        return b
+
+    def _drive(self, b):
+        created = []
+
+        async def fake_sleep(delay, *args, **kwargs):
+            raise StopLoop
+
+        async def fake_live(self, result, dev):
+            created.append(result)
+
+        with mock.patch.object(bridge_mod.asyncio, "sleep", fake_sleep), \
+                mock.patch.object(Bridge, "install_signal_handlers",
+                                  lambda self, loop: None), \
+                mock.patch.object(Bridge, "live_phase_async", fake_live), \
+                mock.patch.object(bridge_mod, "HttpCtapTransport",
+                                  FakeTransport), \
+                mock.patch.object(bridge_mod, "CTAPHIDDevice", FakeDev), \
+                mock.patch.object(bridge_mod, "notify_info") as fake_info:
+            try:
+                asyncio.run(b.run())
+            except StopLoop:
+                pass
+        return created, fake_info
+
+    def test_want_pass_shows_code_and_parks_without_a_device(self):
+        results = [GateResult(True, None, "RDR", 7, want="example"),
+                   GateResult(False, "revoked")]
+        b = self.make(results, totp=[("654321", "2026-09-07T12:00:00Z")])
+        created, fake_info = self._drive(b)
+        self.assertEqual(created, [])           # no UHID device, ever
+        self.assertEqual(b._park_calls, [("RDR", 7)])
+        fake_info.assert_called_once()
+        self.assertEqual(fake_info.call_args[0][0], "TOTP example")
+        self.assertIn("654321", fake_info.call_args[0][1])
+        events = [e for e, _ in b.audit.events]
+        self.assertIn("totp_shown", events)
+        self.assertIn("gate_unpark", events)
+        # The code itself is never written to the audit log.
+        for _, fields in b.audit.events:
+            self.assertNotIn("654321", str(fields))
+
+    def test_totp_failure_still_parks_without_a_device(self):
+        results = [GateResult(True, None, "RDR", 7, want="example"),
+                   GateResult(False, "revoked")]
+        b = self.make(results, totp=[RuntimeError("totp refused: epoch_closed")])
+        created, fake_info = self._drive(b)
+        self.assertEqual(created, [])
+        self.assertEqual(b._park_calls, [("RDR", 7)])   # parks anyway
+        # The refusal is surfaced on screen, not just logged.
+        fake_info.assert_called_once()
+        self.assertIn("epoch_closed", fake_info.call_args[0][1])
+        self.assertNotIn("totp_shown", [e for e, _ in b.audit.events])
+
+
 if __name__ == "__main__":
     unittest.main()

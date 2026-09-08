@@ -13,6 +13,9 @@ DEFAULTS = {
     "retries": 3,            # challenge fetch / network errors (§6.4)
     "reader_filter": None,   # substring match on PC/SC reader name
     "audit_log": "~/.local/state/piv-gate/audit.jsonl",
+    "prompt_on_ambiguous": True,  # applet-picker on dual-applet cards
+    "prompt_timeout": "20s",      # ignored picker defaults to the gate
+    "totp_labels": [],            # non-empty: picker also offers TOTP codes
 }
 
 REQUIRED = ("server_url", "ca_root", "client_cert", "client_key")
@@ -61,6 +64,13 @@ class Config:
         self.reader_filter: Optional[str] = doc.get("reader_filter",
                                                     DEFAULTS["reader_filter"])
         self.audit_log: str = doc.get("audit_log", DEFAULTS["audit_log"])
+        self.prompt_on_ambiguous: bool = bool(
+            doc.get("prompt_on_ambiguous",
+                    DEFAULTS["prompt_on_ambiguous"]))
+        self.prompt_timeout: float = parse_duration(
+            doc.get("prompt_timeout", DEFAULTS["prompt_timeout"]))
+        self.totp_labels: list = list(
+            doc.get("totp_labels", DEFAULTS["totp_labels"]))
 
     @classmethod
     def load(cls, path: str) -> "Config":
