@@ -17,6 +17,12 @@ This fork changes the model:
   (`POST /ctap`); there is no card I/O during the live phase.
 - The gate phase (card present, PIN prompt on a controlling tty, fresh
   nonce signed by the card's PIV 9A key) runs per seat session.
+- A seat picker decides what a card ceremony is for: passkey gate
+  (create the UHID device), or, when TOTP labels are configured, reveal
+  one enrolled site's current code. The secret never touches this
+  machine -- the server returns the code only inside an open epoch, the
+  bridge shows it as a desktop notification, then parks until the card
+  changes.
 
 ## Run
 
@@ -37,3 +43,4 @@ the virtual device exactly as a browser would (also mirrored in
 Rolki-Client).
 
 License: MIT (upstream, Bryan Jacobs -- see `LICENSE`).
+
